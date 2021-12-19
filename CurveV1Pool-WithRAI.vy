@@ -14,6 +14,11 @@ interface Factory:
     def get_fee_receiver(_pool: address) -> address: view
     def admin() -> address: view
 
+interface Curve:
+    def get_virtual_price() -> uint256: view
+
+interface RedemptionPriceSnap:
+    def snappedRedemptionPrice() -> uint256: view
 
 event Transfer:
     sender: indexed(address)
@@ -71,6 +76,7 @@ event StopRampA:
 
 N_COINS: constant(int128) = 2
 PRECISION: constant(int128) = 10 ** 18
+REDMPTION_PRICE_SCALE: constant(uint256) = 10 ** 9
 
 FEE_DENOMINATOR: constant(uint256) = 10 ** 10
 ADMIN_FEE: constant(uint256) = 5000000000
@@ -91,6 +97,12 @@ future_A: public(uint256)
 initial_A_time: public(uint256)
 future_A_time: public(uint256)
 
+# Token corresponding to the pool is always the last one
+BASE_CACHE_EXPIRES: constant(int128) = 10 * 60  # 10 min
+base_pool: public(address)
+base_virtual_price: public(uint256)
+base_cache_updated: public(uint256)
+
 name: public(String[64])
 symbol: public(String[32])
 
@@ -98,6 +110,7 @@ balanceOf: public(HashMap[address, uint256])
 allowance: public(HashMap[address, HashMap[address, uint256]])
 totalSupply: public(uint256)
 
+redemption_price_snap: public(address)
 
 @external
 def __init__():
@@ -298,6 +311,58 @@ def get_D(_xp: uint256[N_COINS], _amp: uint256) -> uint256:
     # if it does happen the pool is borked and LPs can withdraw via `remove_liquidity`
     raise
 
+@view
+@internal
+def _get_D_mem(_rates: uint256[N_COINS], _balances: uint256[N_COINS], _amp: uint256) -> uint256:
+    return self.get_D(self._xp_mem(_rates, _balances), _amp)
+
+@view
+@internal
+def _get_scaled_redemption_price() -> uint256:
+    """
+    @notice Reads a snapshot view of redemption price
+    @dev The fetched redemption price uses 27 decimals
+    @return The redemption price with appropriate scaling to match LP tokens vitual price.
+    """
+    rate: uint256 = RedemptionPriceSnap(self.redemption_price_snap).snappedRedemptionPrice()
+    return rate / REDMPTION_PRICE_SCALE
+
+
+@view
+@internal
+def _xp(_vp_rate: uint256) -> uint256[N_COINS]:
+    result: uint256[N_COINS] = [self._get_scaled_redemption_price(), _vp_rate]
+    for i in range(N_COINS):
+        result[i] = result[i] * self.balances[i] / PRECISION
+    return result
+
+
+@pure
+@internal
+def _xp_mem(_rates: uint256[N_COINS], _balances: uint256[N_COINS]) -> uint256[N_COINS]:
+    result: uint256[N_COINS] = _rates
+    for i in range(N_COINS):
+        result[i] = result[i] * _balances[i] / PRECISION
+    return result
+
+@internal
+def _vp_rate() -> uint256:
+    if block.timestamp > self.base_cache_updated + BASE_CACHE_EXPIRES:
+        vprice: uint256 = Curve(self.base_pool).get_virtual_price()
+        self.base_virtual_price = vprice
+        self.base_cache_updated = block.timestamp
+        return vprice
+    else:
+        return self.base_virtual_price
+
+
+@internal
+@view
+def _vp_rate_ro() -> uint256:
+    if block.timestamp > self.base_cache_updated + BASE_CACHE_EXPIRES:
+        return Curve(self.base_pool).get_virtual_price()
+    else:
+        return self.base_virtual_price
 
 @view
 @external
@@ -308,7 +373,9 @@ def get_virtual_price() -> uint256:
     @return LP token virtual price normalized to 1e18
     """
     amp: uint256 = self._A()
-    D: uint256 = self.get_D(self.balances, amp)
+    vp_rate: uint256 = self._vp_rate_ro()
+    xp: uint256[N_COINS] = self._xp(vp_rate)
+    D: uint256 = self.get_D(xp, amp)
     # D is in the units similar to DAI (e.g. converted to precision 1e18)
     # When balanced, D = n * x_u - total virtual value of the portfolio
     return D * PRECISION / self.totalSupply
@@ -359,10 +426,11 @@ def add_liquidity(
     @return Amount of LP tokens received by depositing
     """
     amp: uint256 = self._A()
+    rates: uint256[N_COINS] = [self._get_scaled_redemption_price(), self._vp_rate_ro()]
     old_balances: uint256[N_COINS] = self.balances
 
     # Initial invariant
-    D0: uint256 = self.get_D(old_balances, amp)
+    D0: uint256 = self._get_D_mem(rates, old_balances, amp)
 
     total_supply: uint256 = self.totalSupply
     new_balances: uint256[N_COINS] = old_balances
@@ -373,12 +441,13 @@ def add_liquidity(
         new_balances[i] += amount
 
     # Invariant after change
-    D1: uint256 = self.get_D(new_balances, amp)
+    D1: uint256 = self._get_D_mem(rates, new_balances, amp)
     assert D1 > D0
 
     # We need to recalculate the invariant accounting for fees
     # to calculate fair user's share
     fees: uint256[N_COINS] = empty(uint256[N_COINS])
+    D2: uint256 = D1
     mint_amount: uint256 = 0
     if total_supply > 0:
         # Only account for fees if we are not the first to deposit
@@ -394,7 +463,7 @@ def add_liquidity(
             fees[i] = base_fee * difference / FEE_DENOMINATOR
             self.balances[i] = new_balance - (fees[i] * ADMIN_FEE / FEE_DENOMINATOR)
             new_balances[i] -= fees[i]
-        D2: uint256 = self.get_D(new_balances, amp)
+        D2: uint256 = self._get_D_mem(rates, new_balances, amp)
         mint_amount = total_supply * (D2 - D0) / D0
     else:
         self.balances = new_balances
